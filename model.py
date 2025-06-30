@@ -1,3 +1,22 @@
+"""
+model.py
+--------
+PyTorchGPT: Core model, dataset, and training framework for GPT-style language models.
+
+This module implements:
+- GPTConfig: Model configuration
+- Rotary Positional Embedding utilities
+- RMSNorm normalization
+- KVCache for efficient inference
+- Multi-head self-attention (MHSA)
+- Transformer Block
+- GPT model class
+- TokenizerWrapper for byte-level BPE
+- BinDataset for efficient token streaming
+- Trainer for end-to-end training
+
+Dependencies: torch, numpy, datasets, tokenizers, tqdm
+"""
 import logging
 import torch.nn.functional as F
 import torch.nn as nn
@@ -20,6 +39,25 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # ───── Config Class ────────────────────────────────────
 class GPTConfig:
+    """
+    Configuration class for GPT model hyperparameters and training options.
+
+    Args:
+        vocab_size (int): Size of the tokenizer vocabulary.
+        block_size (int): Maximum sequence length (context window).
+        embed_dim (int): Embedding dimension.
+        n_heads (int): Number of attention heads.
+        n_layers (int): Number of transformer blocks.
+        dropout (float): Dropout rate.
+        learning_rate (float): Learning rate for optimizer.
+        weight_decay (float): Weight decay for optimizer.
+        betas (tuple): Adam optimizer betas.
+        training (bool): Whether in training mode.
+        dtype (torch.dtype): Data type for tensors.
+        device (str): Device to use ('cpu' or 'cuda').
+        use_rope (bool): Use Rotary Positional Embeddings if True.
+        norm_type (str): Normalization type ('layernorm' or 'rmsnorm').
+    """
     def __init__(self, vocab_size=50257, block_size=256, embed_dim=256,
                  n_heads=4, n_layers=4, dropout=0.1,
                  learning_rate=1e-4, weight_decay=0.1, betas=(0.9, 0.95), training=False,
@@ -41,6 +79,17 @@ class GPTConfig:
 
 # ───── Rotary Positional Embedding ─────────────────────
 def precompute_rope_freqs(seq_len, head_dim, base=10000, device='cuda'):
+    """
+    Precompute rotary positional embedding frequencies for a given sequence length and head dimension.
+
+    Args:
+        seq_len (int): Sequence length.
+        head_dim (int): Dimension per attention head.
+        base (int): RoPE base frequency.
+        device (str): Device for tensor allocation.
+    Returns:
+        torch.Tensor: Precomputed RoPE frequencies (shape: [seq_len, head_dim//2, 2])
+    """
     freqs = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     t = torch.arange(seq_len, device=device)
     freqs = torch.outer(t, freqs)
@@ -48,6 +97,15 @@ def precompute_rope_freqs(seq_len, head_dim, base=10000, device='cuda'):
     return torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)  # shape (seq_len, head_dim//2, 2)
 
 def apply_rope(x, freqs_cis):
+    """
+    Apply rotary positional embeddings to input tensor.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape [B, T, H, D].
+        freqs_cis (torch.Tensor): Precomputed RoPE frequencies.
+    Returns:
+        torch.Tensor: Tensor with RoPE applied.
+    """
     B, T, H, D = x.shape
     x = x.view(B, T, H, D // 2, 2)  # [..., D//2, 2]
     cos = freqs_cis[:, None, :, 0]  # [T, 1, D//2]
@@ -58,11 +116,17 @@ def apply_rope(x, freqs_cis):
     return x_out
 
 def get_dtype_for_device(device):
+    """
+    Utility to select appropriate torch dtype for a given device.
+    """
     if device == 'cuda':
         return torch.float32  # can make it torch.bfloat16 if gpu is bf16 compatible
     return torch.float32
 
 class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization.
+    """
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
@@ -75,6 +139,10 @@ class RMSNorm(nn.Module):
 
 
 class KVCache(nn.Module):
+    """
+    Key-Value cache for efficient transformer inference (used in generation).
+    Stores past key and value tensors for fast autoregressive decoding.
+    """
     def __init__(self, max_batch_size, max_seq_len, n_heads, head_dim, dtype):
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -93,6 +161,15 @@ class KVCache(nn.Module):
         self.current_pos.zero_()
 
     def update(self, input_pos: torch.Tensor, k_val: torch.Tensor, v_val: torch.Tensor):
+        """
+        Update the cache with new key/value tensors at the given positions.
+        Args:
+            input_pos (torch.Tensor): Positions to update.
+            k_val (torch.Tensor): New key values.
+            v_val (torch.Tensor): New value values.
+        Returns:
+            Tuple of (k_cache, v_cache) up to the current max position.
+        """
         B, H, S, D = k_val.shape
         device = self.k_cache.device
 
@@ -125,6 +202,9 @@ class KVCache(nn.Module):
 
 
 class MHSA(nn.Module):
+    """
+    Multi-Head Self-Attention module with optional Rotary Positional Embeddings and KV cache support.
+    """
     def __init__(self, config):
         super().__init__()
         assert config.embed_dim % config.n_heads == 0
@@ -139,6 +219,16 @@ class MHSA(nn.Module):
         self.use_rope = config.use_rope
 
     def forward(self, x, input_pos=None, kv_cache: KVCache = None, freqs_cis=None):
+        """
+        Forward pass for multi-head self-attention.
+        Args:
+            x (torch.Tensor): Input tensor [B, T, C].
+            input_pos (torch.Tensor): Positions for KV cache update (optional).
+            kv_cache (KVCache): Key-value cache for fast inference (optional).
+            freqs_cis (torch.Tensor): RoPE frequencies (optional).
+        Returns:
+            torch.Tensor: Output tensor after attention and projection.
+        """
         x = x.to(DTYPE)
         B, T, C = x.shape
         qkv = self.qkv_proj(x)
@@ -179,6 +269,9 @@ class MHSA(nn.Module):
 
 
 class Block(nn.Module):
+    """
+    Transformer block: Multi-head self-attention + Feedforward + Normalization + Residuals.
+    """
     def __init__(self, config):
         super().__init__()
         norm_class = nn.LayerNorm if config.norm_type == 'layernorm' else RMSNorm
@@ -194,6 +287,9 @@ class Block(nn.Module):
         self.kv_cache = None
 
     def init_cache(self, max_batch_size, max_seq_len, n_heads, head_dim, dtype):
+        """
+        Initialize the KV cache for this block.
+        """
         self.kv_cache = KVCache(max_batch_size, max_seq_len, n_heads, head_dim, dtype=dtype)
         device = next(self.parameters()).device
         self.kv_cache = self.kv_cache.to(device=device, dtype=dtype)
